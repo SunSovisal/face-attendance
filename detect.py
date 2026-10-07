@@ -8,7 +8,7 @@ from backend.app.engine import enroll_directory, load_models, recognize_frame
 KNOWN_DIR = Path("known_faces")
 ATTENDANCE_CSV = Path("attendance_log.csv")
 CAMERA_INDEX = 0
-FRAME_STRIDE = 5
+FRAME_STRIDE = 8
 STICKY_SECONDS = 3.0
 
 
@@ -51,19 +51,22 @@ def main():
             for face in recognize_frame(model, frame, gallery):
                 name = face["name"]
                 dist = face["distance"]
-                if name != "Unknown":
+                if face.get("spoof"):
+                    label = "Photo"
+                elif name != "Unknown":
                     sticky[name] = now
                     log_attendance(name, seen)
+                    label = f"{name} ({dist:.2f})"
                 else:
                     for n, t in list(sticky.items()):
                         if now - t <= STICKY_SECONDS:
                             name, dist = n, dist
                             break
-                label = f"{name} ({dist:.2f})" if name != "Unknown" else "Unknown"
+                    label = f"{name} ({dist:.2f})" if name != "Unknown" else "Unknown"
                 last_labels.append((face["box"], label))
 
         for (x1, y1, x2, y2), label in last_labels:
-            color = (0, 200, 0) if "Unknown" not in label else (0, 0, 220)
+            color = (0, 200, 0) if "Unknown" not in label and label != "Photo" else (0, 0, 220)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 frame,

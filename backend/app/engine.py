@@ -14,6 +14,7 @@ MODEL_NAME = "ArcFace"
 CROP_PAD = 0.25
 WEIGHTS = Path(__file__).resolve().parents[2] / "best.pt"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_spoof = None
 
 
 def l2_normalize(x):
@@ -82,14 +83,44 @@ def match_embedding(emb, gallery):
 
 
 def load_models():
+    global _spoof
+    from deepface.models.spoofing.FasNet import Fasnet
+
     model = YOLO(str(WEIGHTS))
     embed_bgr(np.zeros((64, 64, 3), dtype=np.uint8))
+    _spoof = Fasnet()
+    _spoof.analyze(np.zeros((160, 160, 3), dtype=np.uint8), (40, 40, 80, 80))
     return model
+
+
+def face_is_live(frame, box) -> tuple[bool, float]:
+    """True when MiniFASNet reads the face as a live person, not a photo or screen."""
+    if _spoof is None:
+        return False, 0.0
+    x1, y1, x2, y2 = box
+    try:
+        is_real, score = _spoof.analyze(frame, (x1, y1, x2 - x1, y2 - y1))
+    except Exception:
+        return False, 0.0
+    return bool(is_real), float(score)
 
 
 def recognize_frame(model, frame_bgr, gallery):
     faces = []
     for box in detect_faces(model, frame_bgr):
+        live, _score = face_is_live(frame_bgr, box)
+        if not live:
+            faces.append(
+                {
+                    "box": list(box),
+                    "person_id": None,
+                    "name": "Unknown",
+                    "distance": 10.0,
+                    "matched": False,
+                    "spoof": True,
+                }
+            )
+            continue
         crop = crop_with_pad(frame_bgr, box)
         emb = embed_bgr(crop)
         if emb is None:
@@ -100,6 +131,7 @@ def recognize_frame(model, frame_bgr, gallery):
                     "name": "Unknown",
                     "distance": 9.0,
                     "matched": False,
+                    "spoof": False,
                 }
             )
             continue
@@ -111,6 +143,7 @@ def recognize_frame(model, frame_bgr, gallery):
                 "name": name,
                 "distance": dist,
                 "matched": person_id is not None,
+                "spoof": False,
             }
         )
     return faces

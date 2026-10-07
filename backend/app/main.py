@@ -1,42 +1,31 @@
 """FastAPI app entry."""
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 
+from backend.app import engine as face_engine
 from backend.app import models
+from backend.app.bootstrap import seed_office, seed_super_admin
 from backend.app.config import settings
-from backend.app.db import Base, SessionLocal, engine
-from backend.app.engine import load_models
+from backend.app.db import SessionLocal, migrate
+from backend.app.engine import IMAGE_EXTS, load_models
 from backend.app.gallery import load_gallery
-from backend.app.routes.auth import router as auth_router
-from backend.app.routes.people import router as people_router
+from backend.app.routes.accounts import router as accounts_router
 from backend.app.routes.attendance import router as attendance_router
+from backend.app.routes.auth import router as auth_router
+from backend.app.routes.corrections import router as corrections_router
+from backend.app.routes.employees import add_photo
+from backend.app.routes.employees import router as employees_router
+from backend.app.routes.holidays import router as holidays_router
+from backend.app.routes.leave import router as leave_router
+from backend.app.routes.office import router as office_router
 from backend.app.routes.recognize import router as recognize_router
-from backend.app.security import hash_password
 
-
-def seed_admin() -> None:
-    db = SessionLocal()
-    try:
-        exists = db.query(models.Admin).filter_by(username=settings.admin_username).one_or_none()
-        if exists is None:
-            db.add(
-                models.Admin(
-                    username=settings.admin_username,
-                    password_hash=hash_password(settings.admin_password),
-                )
-            )
-            db.commit()
-    finally:
-        db.close()
 
 def seed_known_faces(model) -> None:
-    from fastapi import HTTPException
-
-    from backend.app.engine import IMAGE_EXTS
-    from backend.app.routes.people import add_photo
-
     db = SessionLocal()
     try:
-        if db.query(models.Person).count() > 0:
+        if db.query(models.Employee).count() > 0:
             print("Known faces already imported")
             return
         if not settings.known_dir.exists():
@@ -45,25 +34,31 @@ def seed_known_faces(model) -> None:
         for path in sorted(settings.known_dir.iterdir()):
             if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
                 continue
-            person = models.Person(name=path.stem)
-            db.add(person)
+            employee = models.Employee(name=path.stem)
+            db.add(employee)
             db.commit()
-            db.refresh(person)
+            db.refresh(employee)
             try:
-                add_photo(db, person, path.read_bytes(), model)
+                add_photo(db, employee, path.read_bytes(), model)
                 print("Seeded:", path.stem)
             except HTTPException as exc:
-                db.delete(person)
+                db.delete(employee)
                 db.commit()
                 print("Skipped:", path.name, exc.detail)
     finally:
         db.close()
 
+
 def create_app() -> FastAPI:
     settings.faces_dir.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
-    seed_admin()
+    settings.attendance_dir.mkdir(parents=True, exist_ok=True)
+    migrate()
+    seed_office()
+    seed_super_admin()
     app = FastAPI()
+    face_engine.WEIGHTS = settings.weights_path
+    face_engine.MATCH_THRESHOLD = settings.match_threshold
+    face_engine.DET_CONF = settings.det_conf
     app.state.model = load_models()
     seed_known_faces(app.state.model)
     db = SessionLocal()
@@ -72,9 +67,24 @@ def create_app() -> FastAPI:
     finally:
         db.close()
     app.include_router(auth_router, prefix="/api")
-    app.include_router(people_router, prefix="/api")
+    app.include_router(accounts_router, prefix="/api")
+    app.include_router(employees_router, prefix="/api")
     app.include_router(attendance_router, prefix="/api")
+    app.include_router(corrections_router, prefix="/api")
+    app.include_router(leave_router, prefix="/api")
+    app.include_router(holidays_router, prefix="/api")
+    app.include_router(office_router, prefix="/api")
     app.include_router(recognize_router, prefix="/api")
+
+    @app.exception_handler(OperationalError)
+    async def database_busy(_request, exc: OperationalError):
+        if "locked" in str(exc).lower():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "The database is open in another program. Close it and try again."},
+            )
+        raise exc
+
     return app
 
 

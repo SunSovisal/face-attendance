@@ -7,6 +7,7 @@ import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
 const auth = useAuthStore()
+const fullName = ref('')
 const username = ref('')
 const password = ref('')
 const error = ref('')
@@ -16,7 +17,7 @@ async function submit() {
   error.value = ''
   saving.value = true
   try {
-    await auth.login(username.value, password.value)
+    await auth.register(fullName.value, username.value, password.value)
     if (auth.me) router.push(homeFor(auth.me))
   } catch (err) {
     error.value = errorText(err)
@@ -34,23 +35,28 @@ async function submit() {
     </div>
     <form class="card card-pad space-y-5" @submit.prevent="submit">
       <div class="space-y-1">
-        <h1 class="page-title">Sign in</h1>
-        <p class="muted">Welcome back. Use your work username.</p>
+        <h1 class="page-title">Create an account</h1>
+        <p class="muted">An admin approves new accounts before you can sign in fully.</p>
       </div>
       <label class="block">
+        <span class="field-label">Full name</span>
+        <input v-model="fullName" class="field" autocomplete="name" placeholder="As it should appear on the roster" required />
+      </label>
+      <label class="block">
         <span class="field-label">Username</span>
-        <input v-model="username" class="field" autocomplete="username" autofocus required />
+        <input v-model="username" class="field" autocomplete="username" required />
       </label>
       <label class="block">
         <span class="field-label">Password</span>
-        <input v-model="password" class="field" type="password" autocomplete="current-password" required />
+        <input v-model="password" class="field" type="password" autocomplete="new-password" minlength="8" required />
+        <p class="hint">At least 8 characters.</p>
       </label>
       <p v-if="error" class="notice notice-danger" role="alert">{{ error }}</p>
-      <button class="btn btn-block" type="submit" :disabled="saving">{{ saving ? 'Signing in…' : 'Sign in' }}</button>
+      <button class="btn btn-block" type="submit" :disabled="saving">{{ saving ? 'Creating…' : 'Create account' }}</button>
     </form>
     <p class="muted text-center">
-      New here?
-      <RouterLink class="font-medium text-ink underline underline-offset-4" to="/register">Create an account</RouterLink>
+      Already registered?
+      <RouterLink class="font-medium text-ink underline underline-offset-4" to="/login">Sign in</RouterLink>
     </p>
   </div>
 </template>

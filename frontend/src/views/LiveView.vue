@@ -1,14 +1,25 @@
 <script setup lang="ts">
 import { nextTick, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { api, errorText, unauthorized } from '../api'
+import PageHeader from '../components/PageHeader.vue'
+import UserAvatar from '../components/UserAvatar.vue'
+import { formatTime } from '../format'
 
 type Face = {
   box: [number, number, number, number]
-  person_id: number | null
+  employee_id: number | null
   name: string
   distance: number
   matched: boolean
+  spoof?: boolean
+  action?: 'check_in' | 'check_out' | 'done'
   match_token?: string
+  confidence?: 'sure' | 'close' | null
+  held?: boolean
+  employee_code?: string
+  position?: string
+  department?: string
 }
 
 type Payload = {
@@ -18,10 +29,31 @@ type Payload = {
 }
 
 type Pending = {
-  personId: number
+  employeeId: number
   name: string
   distance: number
   token: string
+  action: 'check_in' | 'check_out'
+  mode: 'auto' | 'ask'
+  department: string
+  position: string
+  employeeCode: string
+}
+
+type PunchResult = {
+  action?: string
+  undo_token?: string
+  undo_seconds?: number
+  check_in_at?: string | null
+  check_out_at?: string | null
+}
+
+type Undo = {
+  token: string
+  name: string
+  action: 'check_in' | 'check_out'
+  at: string
+  recentId: number
 }
 
 const router = useRouter()
@@ -32,8 +64,15 @@ const error = ref('')
 const confirmError = ref('')
 const notice = ref('')
 const saving = ref(false)
+const undoing = ref(false)
 const pending = ref<Pending | null>(null)
-const loggedToday = ref<number[]>([])
+const undo = ref<Undo | null>(null)
+const settling = ref('')
+const photoMissing = ref(false)
+const photoInFrame = ref(false)
+const recent = ref<{ id: number; name: string; action: 'check_in' | 'check_out'; at: string }[]>([])
+let recentId = 0
+let undoTimer = 0
 
 let stream: MediaStream | null = null
 let socket: WebSocket | null = null
@@ -41,22 +80,6 @@ let stopRequested = false
 let streakId: number | null = null
 let streakCount = 0
 const ignoredUntil = new Map<number, number>()
-
-function today() {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Phnom_Penh' }).format(new Date())
-}
-
-async function loadToday() {
-  const day = today()
-  const response = await fetch(`/api/attendance?from=${day}&to=${day}`, { credentials: 'include' })
-  if (response.status === 401) {
-    router.push('/login')
-    return
-  }
-  if (!response.ok) return
-  const rows = (await response.json()) as { person_id: number | null }[]
-  loggedToday.value = rows.flatMap((row) => (typeof row.person_id === 'number' ? [row.person_id] : []))
-}
 
 function fitSize(width: number, height: number) {
   const scale = Math.min(1, 640 / Math.max(width, height))
@@ -89,7 +112,7 @@ function drawFaces(canvas: HTMLCanvasElement, faces: Face[]) {
     context.strokeStyle = color
     context.fillStyle = color
     context.strokeRect(x1, y1, x2 - x1, y2 - y1)
-    const label = face.matched ? `${face.name} ${face.distance.toFixed(2)}` : 'Unknown'
+    const label = face.spoof ? 'Photo' : face.matched ? `${face.name} ${face.distance.toFixed(2)}` : 'Unknown'
     context.fillText(label, x1, Math.max(16, y1 - 6))
   }
 }
@@ -98,52 +121,84 @@ function boxArea(face: Face) {
   return (face.box[2] - face.box[0]) * (face.box[3] - face.box[1])
 }
 
-function refreshPending(faces: Face[]) {
-  if (!pending.value) return
-  const same = faces.find(
-    (face) => face.matched && face.person_id === pending.value?.personId && face.match_token,
-  )
-  if (!same?.match_token || same.person_id == null) return
-  pending.value = {
-    personId: same.person_id,
-    name: same.name,
-    distance: same.distance,
-    token: same.match_token,
+function asPending(face: Face): Pending | null {
+  if (face.employee_id == null || !face.match_token) return null
+  return {
+    employeeId: face.employee_id,
+    name: face.name,
+    distance: face.distance,
+    token: face.match_token,
+    action: face.action === 'check_out' ? 'check_out' : 'check_in',
+    mode: face.confidence === 'sure' ? 'auto' : 'ask',
+    department: face.department ?? '',
+    position: face.position ?? '',
+    employeeCode: face.employee_code ?? '',
   }
 }
 
+function showPending(next: Pending) {
+  if (pending.value?.employeeId !== next.employeeId) photoMissing.value = false
+  const mode = pending.value?.employeeId === next.employeeId ? pending.value.mode : next.mode
+  pending.value = { ...next, mode }
+}
+
+function armUndo(next: Undo, seconds: number) {
+  undo.value = next
+  window.clearTimeout(undoTimer)
+  undoTimer = window.setTimeout(() => {
+    undo.value = null
+  }, Math.max(1, seconds) * 1000)
+}
+
+function refreshPending(faces: Face[]) {
+  if (!pending.value) return
+  const same = faces.find((face) => face.employee_id === pending.value?.employeeId)
+  if (!same || same.action === 'done' || !same.match_token || same.employee_id == null) {
+    if (same?.action === 'done') pending.value = null
+    return
+  }
+  const next = asPending(same)
+  if (next) showPending(next)
+}
+
 function noteFrame(faces: Face[]) {
+  photoInFrame.value = faces.some((face) => face.spoof)
+  if (saving.value) return
   refreshPending(faces)
   if (pending.value) return
   const known = faces
-    .filter((face) => face.matched && face.person_id != null && face.match_token)
+    .filter((face) => face.matched && face.employee_id != null && face.match_token && face.action !== 'done')
     .sort((a, b) => boxArea(b) - boxArea(a))
   const best = known[0]
-  if (!best || best.person_id == null || !best.match_token) {
+  if (!best || best.employee_id == null || !best.match_token) {
     streakId = null
     streakCount = 0
+    settling.value = ''
     return
   }
   const now = Date.now()
-  if (loggedToday.value.includes(best.person_id) || now < (ignoredUntil.get(best.person_id) ?? 0)) {
+  if (now < (ignoredUntil.get(best.employee_id) ?? 0)) {
     streakId = null
     streakCount = 0
+    settling.value = ''
     return
   }
-  if (streakId === best.person_id) streakCount += 1
+  if (streakId === best.employee_id) streakCount += 1
   else {
-    streakId = best.person_id
+    streakId = best.employee_id
     streakCount = 1
   }
-  if (streakCount < 3) return
-  pending.value = {
-    personId: best.person_id,
-    name: best.name,
-    distance: best.distance,
-    token: best.match_token,
+  if (streakCount < 3) {
+    settling.value = best.name
+    return
   }
+  const next = asPending(best)
+  settling.value = ''
+  if (!next) return
+  showPending(next)
   streakId = null
   streakCount = 0
+  if (next.mode === 'auto') void confirmYes()
 }
 
 function sleep(ms: number) {
@@ -209,11 +264,7 @@ function openSocket() {
   socket = next
   return new Promise<void>((resolve, reject) => {
     next.addEventListener('open', () => resolve(), { once: true })
-    next.addEventListener(
-      'close',
-      () => reject(new Error('Recognition disconnected.')),
-      { once: true },
-    )
+    next.addEventListener('close', () => reject(new Error('Recognition disconnected.')), { once: true })
   })
 }
 
@@ -222,7 +273,6 @@ async function start() {
   notice.value = ''
   confirmError.value = ''
   stopRequested = false
-  await loadToday()
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'user' },
@@ -261,81 +311,198 @@ function stop() {
   streakCount = 0
 }
 
+async function snapshotBlob() {
+  const video = videoRef.value
+  if (!video || video.videoWidth === 0) return null
+  const canvas = document.createElement('canvas')
+  const size = fitSize(video.videoWidth, video.videoHeight)
+  canvas.width = size.width
+  canvas.height = size.height
+  const context = canvas.getContext('2d')
+  if (!context) return null
+  context.drawImage(video, 0, 0, size.width, size.height)
+  return canvasBlob(canvas)
+}
+
 async function confirmYes() {
   if (!pending.value || saving.value) return
   saving.value = true
   confirmError.value = ''
   const current = pending.value
-  const response = await fetch('/api/attendance', {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ match_token: current.token }),
-  })
-  saving.value = false
-  if (response.status === 409 || response.ok) {
-    if (!loggedToday.value.includes(current.personId)) {
-      loggedToday.value = [...loggedToday.value, current.personId]
+  const shot = await snapshotBlob()
+  if (!shot) {
+    confirmError.value = 'Could not capture the current frame.'
+    saving.value = false
+    if (current.mode === 'auto') {
+      ignoredUntil.set(current.employeeId, Date.now() + 8000)
+      pending.value = null
     }
-    notice.value = response.status === 409 ? `${current.name} is already logged today` : `${current.name} logged for today`
-    confirmError.value = ''
-    pending.value = null
     return
   }
-  confirmError.value = response.status === 400 ? 'That match expired. Keep the face in view and try again.' : 'Could not save attendance.'
+  const body = new FormData()
+  body.append('match_token', current.token)
+  body.append('snapshot', shot, 'check-in.jpg')
+  try {
+    const saved = await api<PunchResult>(`/api/attendance/punch`, { method: 'POST', body })
+    const action: Pending['action'] = saved.action === 'check_out' ? 'check_out' : 'check_in'
+    const at = formatTime((action === 'check_out' ? saved.check_out_at : saved.check_in_at) || new Date().toISOString())
+    const id = ++recentId
+    recent.value = [{ id, name: current.name, action, at }, ...recent.value].slice(0, 8)
+    if (saved.undo_token) {
+      notice.value = ''
+      armUndo({ token: saved.undo_token, name: current.name, action, at, recentId: id }, saved.undo_seconds ?? 8)
+    } else {
+      notice.value = `${current.name} ${action === 'check_out' ? 'checked out' : 'checked in'}.`
+    }
+    pending.value = null
+  } catch (err) {
+    if (unauthorized(err)) {
+      router.push('/login')
+      return
+    }
+    confirmError.value = errorText(err)
+    if (current.mode === 'auto') {
+      ignoredUntil.set(current.employeeId, Date.now() + 8000)
+      pending.value = null
+    }
+  } finally {
+    saving.value = false
+  }
+}
+
+async function undoPunch() {
+  if (!undo.value || undoing.value) return
+  undoing.value = true
+  confirmError.value = ''
+  const current = undo.value
+  try {
+    await api('/api/attendance/undo', {
+      method: 'POST',
+      body: JSON.stringify({ undo_token: current.token }),
+    })
+    window.clearTimeout(undoTimer)
+    undo.value = null
+    notice.value = `Undone. ${current.name} was not ${current.action === 'check_out' ? 'checked out' : 'checked in'}.`
+    recent.value = recent.value.filter((entry) => entry.id !== current.recentId)
+  } catch (err) {
+    if (unauthorized(err)) {
+      router.push('/login')
+      return
+    }
+    confirmError.value = errorText(err)
+  } finally {
+    undoing.value = false
+  }
 }
 
 function dismiss() {
   if (!pending.value) return
-  ignoredUntil.set(pending.value.personId, Date.now() + 8000)
+  ignoredUntil.set(pending.value.employeeId, Date.now() + 8000)
   pending.value = null
   confirmError.value = ''
 }
 
-onUnmounted(stop)
+onUnmounted(() => {
+  window.clearTimeout(undoTimer)
+  stop()
+})
 </script>
 
 <template>
   <section class="space-y-6">
-    <div class="flex flex-wrap items-end justify-between gap-4">
-      <div class="space-y-1">
-        <h1 class="page-title">Live</h1>
-        <p class="muted">Recognize faces from your camera and confirm check-ins.</p>
-      </div>
+    <PageHeader title="Live desk" subtitle="A clear match is saved on its own. A close match waits for you.">
+      <span v-if="running" class="chip chip-good">
+        <span class="h-1.5 w-1.5 rounded-full bg-good" aria-hidden="true"></span>
+        Camera on
+      </span>
       <button v-if="running" class="btn-quiet" type="button" @click="stop">Stop camera</button>
-    </div>
+    </PageHeader>
 
-    <p v-if="error" class="error">{{ error }}</p>
-    <p v-else-if="notice" class="muted">{{ notice }}</p>
+    <p v-if="error" class="notice notice-danger" role="alert">{{ error }}</p>
+    <p v-else-if="undo" class="notice notice-good" role="status">
+      {{ undo.name }} {{ undo.action === 'check_out' ? 'checked out' : 'checked in' }} at {{ undo.at }}.
+      <button class="btn-link !px-1" type="button" :disabled="undoing" @click="undoPunch">
+        {{ undoing ? 'Undoing…' : 'Undo' }}
+      </button>
+    </p>
+    <p v-else-if="notice" class="notice notice-good" role="status">{{ notice }}</p>
+    <p v-if="confirmError" class="notice notice-danger" role="alert">{{ confirmError }}</p>
 
-    <div class="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_18rem]">
+    <div class="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
       <div class="card relative overflow-hidden">
         <video ref="videoRef" class="pointer-events-none absolute h-px w-px opacity-0" playsinline muted />
         <canvas v-show="running" ref="canvasRef" class="block h-auto w-full" />
-        <div v-if="!running" class="card-pad grid place-items-center gap-4 py-12 text-center">
-          <p class="text-sm font-medium">Camera is not running</p>
-          <p class="muted max-w-sm">
-            Start the camera to see faces with a box and a name. A person is logged only after you confirm.
-          </p>
-          <button class="btn" type="button" @click="start">Start camera</button>
+        <div v-if="!running" class="empty aspect-[4/3] max-h-[28rem] w-full gap-3">
+          <span class="avatar avatar-lg text-lg" aria-hidden="true">◎</span>
+          <p class="section-title">Camera is off</p>
+          <p class="muted max-w-sm">A clear match checks in on its own. You still confirm a close one.</p>
+          <button class="btn mt-2" type="button" @click="start">Start camera</button>
         </div>
       </div>
 
-      <aside class="card card-pad space-y-4">
-        <h2 class="text-sm font-medium">Confirm</h2>
-        <template v-if="pending">
-          <p class="text-lg font-semibold tracking-tight">{{ pending.name }}</p>
-          <p class="muted">Distance {{ pending.distance.toFixed(2) }}</p>
-          <p v-if="confirmError" class="error">{{ confirmError }}</p>
-          <div class="flex flex-wrap gap-3">
-            <button class="btn" type="button" :disabled="saving" @click="confirmYes">
-              {{ saving ? 'Saving…' : 'Yes' }}
-            </button>
-            <button class="btn-quiet" type="button" :disabled="saving" @click="dismiss">Not this person</button>
+      <aside class="space-y-4">
+        <div class="card overflow-hidden" aria-live="polite">
+          <template v-if="pending">
+            <img
+              v-if="!photoMissing"
+              :src="`/api/employees/${pending.employeeId}/photo`"
+              :alt="`${pending.name}'s enrolled photo`"
+              class="aspect-[3/4] w-full bg-soft object-cover object-top"
+              @error="photoMissing = true"
+            />
+            <div v-else class="grid aspect-[3/4] w-full place-items-center bg-soft">
+              <UserAvatar :name="pending.name" large />
+            </div>
+            <div class="space-y-4 p-5">
+              <div class="min-w-0">
+                <p class="truncate text-xl font-semibold tracking-tight">{{ pending.name }}</p>
+                <p class="muted">{{ pending.department || 'No department' }}</p>
+              </div>
+              <dl class="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-y-1.5 text-sm">
+                <dt class="text-mute">Code</dt>
+                <dd class="truncate">{{ pending.employeeCode || '—' }}</dd>
+                <dt class="text-mute">Position</dt>
+                <dd class="truncate">{{ pending.position || '—' }}</dd>
+                <dt class="text-mute">Match</dt>
+                <dd class="num">{{ pending.distance.toFixed(2) }}</dd>
+              </dl>
+              <p v-if="pending.mode === 'auto'" class="text-sm">Saving this punch.</p>
+              <p v-else class="text-sm">Close match. Confirm this is them.</p>
+              <div v-if="pending.mode !== 'auto'" class="grid gap-2">
+                <button class="btn btn-block !py-3 !text-base" type="button" :disabled="saving" @click="confirmYes">
+                  {{ saving ? 'Saving…' : pending.action === 'check_out' ? 'Check out' : 'Check in' }}
+                </button>
+                <button class="btn-quiet btn-block" type="button" :disabled="saving" @click="dismiss">Not this person</button>
+              </div>
+            </div>
+          </template>
+          <p v-else-if="running && photoInFrame" class="muted p-5">
+            That looks like a photo. Hold a live face in view.
+          </p>
+          <p v-else-if="running && settling" class="muted p-5">Hold still, {{ settling }}…</p>
+          <p v-else class="muted p-5">
+            {{ running ? 'Waiting for a known face to hold steady…' : 'Start the camera to begin.' }}
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-head !py-3">
+            <p class="section-title">This session</p>
+            <span class="muted">{{ recent.length }}</span>
           </div>
-        </template>
-        <p v-else class="muted">A known face must hold steady before you can log them.</p>
+          <ul v-if="recent.length" class="list">
+            <li v-for="entry in recent" :key="entry.id" class="flex items-center gap-3 px-5 py-2.5 text-sm">
+              <span class="min-w-0 flex-1 truncate">{{ entry.name }}</span>
+              <span :class="entry.action === 'check_out' ? 'chip chip-neutral' : 'chip chip-good'">
+                {{ entry.action === 'check_out' ? 'Out' : 'In' }}
+              </span>
+              <span class="num text-mute">{{ entry.at }}</span>
+            </li>
+          </ul>
+          <p v-else class="muted px-5 py-4">No punches yet.</p>
+        </div>
       </aside>
     </div>
   </section>
 </template>
+

@@ -34,13 +34,16 @@ DATABASE_URL=sqlite:///../data/app.db
 FACES_DIR=../data/faces
 KNOWN_DIR=../known_faces
 MATCH_THRESHOLD=0.50
+AUTO_MATCH_THRESHOLD=0.40
 DET_CONF=0.45
 MATCH_TOKEN_SECONDS=20
+PUNCH_COOLDOWN_SECONDS=45
+UNDO_SECONDS=8
 ```
 
-`ADMIN_PASSWORD` is stored only when the admin account is first created. Changing it later in `.env` does not update the existing account. To apply a new password, delete the `admins` row in `data/app.db` and start the API again.
+`ADMIN_USERNAME` and `ADMIN_PASSWORD` are the super admin, stored only when that account is first created. Changing the password later in `.env` does not update the existing account. To apply a new password, delete that user in `data/app.db` and start the API again. There is only one super admin. Other people register from the sign-in page, and the super admin can promote them.
 
-`MATCH_THRESHOLD` is a cosine distance. A face is recognized when the distance is **0.50 or lower**. Lower means a closer match.
+`MATCH_THRESHOLD` is a cosine distance. A face is recognized when the distance is **0.50 or lower**. Lower means a closer match. At or below `AUTO_MATCH_THRESHOLD` the desk punches on its own. Between that and `MATCH_THRESHOLD` someone still confirms. After a punch the same person is held for `PUNCH_COOLDOWN_SECONDS` and until they leave the frame. **Undo** stays up for `UNDO_SECONDS`.
 
 Start the API from the repo root:
 
@@ -67,9 +70,16 @@ The Vite dev server proxies `/api` to port 8000, including the live recognition 
 
 ## What the pages do
 
-- **People** enrolls one face per photo. A photo with no face or more than one face is rejected.
-- **Live** draws boxes on the camera frame. A known face is logged only after you press **Yes**. Each person can be logged once per calendar day in `APP_TIMEZONE`.
-- **Attendance** lists those confirmed check-ins.
+Sign in, or register an employee account. A new registration stays pending until an admin activates it and adds a photo with exactly one face.
+
+- **Live** is the desk. A clear match checks in or out on its own and can be undone for a few seconds. A close match still asks you to confirm. The punch stores the current frame.
+- **Today** and **Month** summarize the office. **Attendance** lists each workday, including absences. Admins can correct a time if they record a reason, and employees can request that correction. Both lists download as CSV.
+- **Password**, in the sidebar, changes your own password. The super admin can set a password on Accounts. An admin can set an employee's password on Employees.
+- **Employees** is the roster, departments, and face photos. Someone already enrolled can get a login from their row.
+- **Leave** and **Holidays** decide which days are not absences.
+- **Accounts** and **Office hours** are for the super admin. Accounts promotes an employee to admin or demotes them. Office hours are the one schedule used for late and absent.
+
+Employees only see their own attendance and their leave requests. The product rules are in `SCOPE.md`.
 
 Uploaded photos and the SQLite database live under `data/`, which is not committed.
 
