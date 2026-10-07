@@ -67,7 +67,7 @@ SQLite (data/app.db)          files (data/faces, data/attendance)
 Three boundaries:
 
 1. **Who is calling.** Login returns an HTTP-only cookie for 12 hours. The token stores the user id. Every request loads that user and checks `role` and `status`. The WebSocket does the same check before it accepts frames.
-2. **Who was seen.** The desk sends a JPEG. The API detects faces, embeds them, and compares cosine distance to enrolled samples. A match at **0.50 or lower** gets a short-lived match token bound to that admin and that employee. Confirming a punch consumes the token and stores the frame. The browser cannot invent a punch without a token the server just issued.
+2. **Who was seen.** The desk sends a JPEG. Each face is judged in order: quality, then liveness, then a 1:N search of stored templates. Cosine distance is the score. Lower is closer. A match at **0.50 or lower** can get a short-lived match token bound to that admin and that employee. Confirming a punch consumes the token and stores the frame. The browser cannot invent a punch without a token the server just issued.
 3. **What the day means.** Punches are not the record the HR screens read. Each employee has at most one workday row per local date. Check-in and check-out fill that row. Status, late minutes, and time worked are derived from the office schedule, approved leave, and holidays.
 
 ### Data
@@ -78,7 +78,7 @@ Three boundaries:
 
 `employees` — the HR profile and the face identity. Unique link to `users` when they have an account. Employee code, name, position, `active` or `inactive`. Face samples hang off this row, as they do off people today.
 
-`face_samples` — photo path plus ArcFace embedding.
+`face_samples` — one photo and one ArcFace embedding per row. An employee holds up to five. The rows are searched one by one. They are not averaged into a single template.
 
 `attendance_days` — one row per employee per `local_date`. Check-in time, distance, snapshot, and which user confirmed it. The same four fields for check-out. Computed `status`, `late_minutes`, `early_minutes`, `worked_minutes`. A note when a time was corrected by hand.
 
@@ -88,14 +88,35 @@ Three boundaries:
 
 `office_settings` — one row: work start, work end, grace minutes, which weekdays are off. The super admin edits this in the app. Recognition settings (`MATCH_THRESHOLD`, weights, paths) stay in `backend/.env`.
 
-Photos in `known_faces/` still import once when the employee table is empty. The filename becomes the name. Those imports have no login until someone registers and an admin links them, or they stay as face-only employees the desk can punch.
+Photos in `known_faces/` still import once when the employee table is empty. The filename becomes the name. A file that fails the enrollment face check is skipped. Those imports have no login until someone registers and an admin links them, or they stay as face-only employees the desk can punch.
+
+### Face check
+
+The same function judges an enrollment photo and a live box. Enrollment asks for a larger face. The desk also requires liveness, because an enrollment photo is a still.
+
+| Check | Enrollment photo | Live frame |
+| --- | --- | --- |
+| Faces | Exactly one | Each box on its own |
+| Size | Shorter side at least **120 px** | Shorter side at least **15%** of the frame height |
+| Brightness | Mean of the crop from **40** to **220** | Same |
+| Sharpness | Laplacian variance at least **80** | Same |
+| Liveness | Not required | MiniFASNet must call the face real |
+| Templates | Stored as its own embedding | Compared by cosine distance |
+
+Search stays 1:N. Every sample of every matchable employee is compared, and the smallest distance wins. A new photo within **0.15** of a sample that employee already has is refused, so the five stay different. A sixth photo is refused until one is deleted.
+
+A match is **0.50** or lower. A punch that happens on its own also needs **0.40** or lower, a passed quality check, and a gap of at least **0.05** to the next employee. A smaller gap stays on the confirm step.
+
+A printed photo or a screen is labeled **Photo**, is not embedded, and cannot match. A live face that fails size, light, or sharpness is labeled **Move closer**. It gets no match token and does not start the three-frame streak. Liveness and identity stay separate scores.
+
+Pose, landmarks, and occlusion are not part of this check.
 
 ### Request path for a punch
 
 1. An admin opens Live and starts the camera.
-2. Frames go to `/api/recognize`. Unknown faces are drawn and discarded. A photo fails the liveness check and is not a match.
+2. Frames go to `/api/recognize`. Each box is checked for quality, then liveness, then matched against every stored template. **Photo** and **Move closer** are drawn and get no token. An unknown face is drawn and discarded.
 3. The same known employee must be the largest face for three frames.
-4. A clear match sends the match token and the current frame to `POST /api/attendance/punch`. A close match waits until someone presses **Check in** or **Check out**.
+4. A clear match sends the match token and the current frame to `POST /api/attendance/punch`. A close match, including a clear distance whose next employee is within **0.05**, waits until someone presses **Check in** or **Check out**.
 5. The API writes the punch, recomputes the day, and returns an undo token.
 6. **Undo** calls `POST /api/attendance/undo` before that token expires.
 
@@ -111,7 +132,7 @@ Register asks for full name, username, and password. It creates a `pending` empl
 
 A pending user can sign in and sees only a waiting notice. They are not on the roster, and the camera cannot match them yet.
 
-An admin or the super admin activates the account and adds a photo with exactly one face. Extra photos add embeddings. After that, the desk can recognize them, and workdays count.
+An admin or the super admin activates the account and adds a photo that passes the enrollment face check. Up to five different photos. After that, the desk can recognize them, and workdays count.
 
 Sign in is the same form for every role. The home page depends on the role: employees land on My attendance, admins land on Live.
 
@@ -125,7 +146,7 @@ The list shows every user, their role, and their status. From here the owner act
 
 ### Employees
 
-Admins maintain the roster: name, employee code, department, position, active or inactive, and face photos. A photo with no face or more than one face is rejected. Deleting an employee removes their photos and embeddings. Past workdays keep the stored name.
+Admins maintain the roster: name, employee code, department, position, active or inactive, and face photos. A photo that fails the enrollment face check is rejected, and the screen shows why. Deleting an employee removes their photos and embeddings. Past workdays keep the stored name.
 
 Inactive employees stay in history and are not expected on future days.
 
@@ -137,9 +158,9 @@ There is no per-person shift in this version. Everyone on the active roster foll
 
 ### Live desk
 
-A clear match punches itself. The distance must be at or below `AUTO_MATCH_THRESHOLD` (0.40 unless `MATCH_THRESHOLD` is stricter), the face must pass the liveness check, and the same person must be the largest face for three frames. The desk then shows who was punched and the time, with **Undo** for `UNDO_SECONDS` (8).
+A clear match punches itself. The distance must be at or below `AUTO_MATCH_THRESHOLD` (0.40 unless `MATCH_THRESHOLD` is stricter), the face must pass the live face check, the next employee must be at least **0.05** farther away, and the same person must be the largest face for three frames. The desk then shows who was punched and the time, with **Undo** for `UNDO_SECONDS` (8).
 
-A close match, above that line and still at or below `MATCH_THRESHOLD`, keeps the confirm step. **Check in** or **Check out**, then **Not this person** hides that employee for eight seconds.
+A close match, above that line and still at or below `MATCH_THRESHOLD`, keeps the confirm step. So does a would-be clear match when another employee is within **0.05**. **Check in** or **Check out**, then **Not this person** hides that employee for eight seconds.
 
 Check-in opens today's workday. A second check-in the same day is refused.
 
@@ -217,12 +238,12 @@ The header shows only the links that role can open.
 In this version:
 
 - One super admin, promotable admins, and self-registered employees.
-- One office schedule, departments, and a face per active employee.
-- Check-in and check-out, with a snapshot. A clear match is automatic. A close match is confirmed.
+- One office schedule, departments, and up to five face templates per active employee.
+- Check-in and check-out, with a snapshot. A clear match is automatic when the frame passes the face check and no other employee is nearly as close. A close match is confirmed.
 - Derived status: present, late, left early, incomplete, absent, on leave, holiday.
 - Leave requests and office holidays.
 - Today and month summaries.
-- A clear face match punches itself, with undo. A close match still asks for confirmation.
+- A clear face match punches itself, with undo. A close match, or a near tie between two employees, still asks for confirmation.
 - Manual correction of a punch time, with a reason, including a request an employee sends and an admin approves.
 - CSV download of the attendance list and the month summary.
 - Password change, and a reset by an admin or the super admin.
@@ -236,5 +257,7 @@ Not in this version:
 - Punching from an employee's own phone. The desk camera is the only punch.
 - Email or chat notifications.
 - Saving unknown faces.
-- Liveness checks beyond the person at the desk looking at the frame.
+- Pose, landmark, or occlusion checks. Size, brightness, and blur are the quality gate.
+- Averaging an employee's templates into one vector.
+- Liveness on enrollment photos. Liveness runs on the live desk only.
 - `detect.py`. That script writes `attendance_log.csv` and the website does not read it.
