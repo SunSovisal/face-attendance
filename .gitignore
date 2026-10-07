@@ -1,4 +1,6 @@
 data/
+known_faces/
+attendance_log.csv
 face-dataset.zip
 backend/.env
 .venv/
